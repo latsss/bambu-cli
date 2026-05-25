@@ -7,9 +7,14 @@
     "bambu-cli": "./index.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "license": "WTFPL",
+  "scripts": {
+    "bundle": "esbuild index.js --bundle --platform=node --target=node20 --format=cjs --outfile=dist/bambu-cli.cjs --legal-comments=none",
+    "build:sea": "bash scripts/build-sea.sh",
+    "clean": "rm -rf dist sea-prep.blob"
+  },
   "dependencies": {
     "@xmldom/xmldom": "^0.9.5",
     "basic-ftp": "^5.0.4",
@@ -19,5 +24,8 @@
     "mqtt": "^5.13.1",
     "pngjs": "^7.0.0",
     "yaml": "^2.8.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
   }
 }

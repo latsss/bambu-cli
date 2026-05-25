@@ -1,0 +1,76 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.asset }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            asset: bambu-cli-darwin-arm64
+          - os: macos-13
+            asset: bambu-cli-darwin-x64
+          - os: ubuntu-latest
+            asset: bambu-cli-linux-x64
+          - os: windows-latest
+            asset: bambu-cli-windows-x64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build SEA binary
+        shell: bash
+        run: npm run build:sea
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          mkdir -p out
+          src=dist/bambu-cli
+          [ -f "$src.exe" ] && src="$src.exe"
+          cp "$src" "out/${{ matrix.asset }}"
+          ls -la out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List downloaded assets
+        run: ls -la artifacts/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

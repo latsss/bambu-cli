@@ -2,3 +2,5 @@ package-lock.json
 .env
 node_modules
 .claude-logs/
+dist/
+sea-prep.blob

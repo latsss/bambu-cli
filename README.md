@@ -8,8 +8,30 @@ Huge shoutout to https://github.com/Doridian/OpenBambuAPI.
 
 ## Install
 
+**One-liner (macOS / Linux)** — downloads the latest release binary into `~/.local/bin`:
+
 ```bash
+curl -fsSL https://raw.githubusercontent.com/latsss/bambu-cli/main/install.sh | sh
+```
+
+For a different destination:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/latsss/bambu-cli/main/install.sh | BINDIR=/usr/local/bin sudo sh
+```
+
+**Windows** — grab `bambu-cli-windows-x64.exe` from the
+[latest release](https://github.com/latsss/bambu-cli/releases/latest), rename to
+`bambu-cli.exe`, and put it somewhere on your `PATH`.
+
+**From source** (requires Node 20+):
+
+```bash
+git clone https://github.com/latsss/bambu-cli && cd bambu-cli
+npm install
 npm install -g .
+# or build a standalone binary for your OS:
+npm run build:sea   # output at dist/bambu-cli
 ```
 
 ## Add your printer

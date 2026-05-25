@@ -1,69 +1,93 @@
 # Bambu CLI
 
-A simple command-line tool to control Bambu Lab 3D printers over LAN mode.
-The main feature is skipping objects: just execute 'get-objects', chose which object were failed and put their IDs into the 'skip' subcommand.
+A simple command-line tool to control Bambu Lab 3D printers over LAN mode (LAN and LAN+dev).
+The headline feature is skipping failed objects: run `get-objects`, pick the IDs that failed,
+and pass them to `skip`.
 
 Huge shoutout to https://github.com/Doridian/OpenBambuAPI.
 
-## Quick Start
+## Install
 
-### Install
 ```bash
 npm install -g .
 ```
 
-### Add your printer
+## Add your printer
+
 ```bash
 bambu-cli config add my-printer 192.168.1.100 01S00A1234567890 your-access-code
 ```
 
-### Basic commands
+Config is stored at `~/.bambu-cli/config.yml` with mode `0600` (access codes live in it,
+so the file is only readable by you).
+
+## Commands
+
 ```bash
-# Check printer status
+# Info
 bambu-cli status my-printer
+bambu-cli status --all              # query every configured printer
+bambu-cli version my-printer
+bambu-cli monitor my-printer        # stream live updates until Ctrl+C
 
-# Get current print objects
-bambu-cli get-objects my-printer --colored
-
-# Skip failed objects
+# Print control
+bambu-cli pause my-printer
+bambu-cli resume my-printer
+bambu-cli stop my-printer
+bambu-cli start my-printer /file.3mf
 bambu-cli skip my-printer 1993 1994
-```
 
-### Custom Commands
-For not implemented functionality and testing. Put json in it as shown.
-```bash
-# Enable work light
+# Objects
+bambu-cli get-objects my-printer --colored
+bambu-cli get-objects my-printer --shape    # silhouettes from the 3MF's top-down PNG
+
+# LED
+bambu-cli light my-printer on
+bambu-cli light my-printer off --node chamber_light
+
+# Filament
+bambu-cli filament unload my-printer
+
+# Files (FTP)
+bambu-cli fs ls my-printer /
+bambu-cli fs pull my-printer /Metadata/plate_1.png
+bambu-cli fs push my-printer ./model.3mf /model.3mf
+
+# Custom MQTT (for experimentation)
 bambu-cli command my-printer '{"system":{"sequence_id":"0","command":"ledctrl","led_node":"work_light","led_mode":"on"}}'
-
-# Pause print
-bambu-cli command my-printer '{"print": {"sequence_id": "0", "command": "pause"}}'
 ```
+
+## Global flags
+
+```
+-v, --verbose      verbose logging (debug level, written to stderr)
+-q, --quiet        only log errors
+    --json         machine-readable JSON output to stdout
+    --no-color     disable colored output (also honors NO_COLOR env)
+```
+
+Logs always go to stderr; `--json` keeps stdout clean for piping into `jq`/scripts.
 
 ## Setup
 
-1. **Enable LAN mode** on your Bambu printer
-2. **Get your access code** from the printer's network settings
-3. **Find your printer's IP** address on your network
-4. **Add printer to config**:
-   ```bash
-   bambu-cli config add <name> <ip> <device-id> <access-code>
-   ```
-Config file is located under `~/.bambu-cli/config.yml`
+1. Enable **LAN mode** (and optionally **LAN+dev** for richer telemetry) on your printer.
+2. Get the **access code** from the printer's network settings.
+3. Find the printer's **IP address** on your network.
+4. Add the printer via `bambu-cli config add`.
 
 ## Notes
 
-- Works with Bambu Lab printers in LAN mode. Tested with A1 and A1 mini.
-- Requires network access to the printer
-- Some commands only work when actively printing
-- Mostly vibe-coded, so some(or most) decisions are highly questionable, but it gets the job done, and doing it manually would take eternity.
+- Tested with A1 and A1 mini.
+- `fs pull` refuses to write outside the current working directory unless you pass an
+  absolute local path or `--allow-outside`. Belt-and-suspenders against typos.
+- For LAN+dev specifically, the same commands work — you just get more fields in `status` /
+  `monitor` output.
+- Mostly vibe-coded, then mostly de-vibed.
 
 ## Help
 
 ```bash
-# General help
 bambu-cli --help
-
-# Command-specific help
 bambu-cli status --help
 bambu-cli skip --help
-``` 
+```

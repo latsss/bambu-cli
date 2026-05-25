@@ -1,62 +1,32 @@
 const mqtt = require("mqtt");
 const fs = require("fs");
 const path = require("path");
+const logger = require("../../utils/logger");
+
+const CA_CERT = fs.readFileSync(path.join(__dirname, "../../utils/mqtt/ca_cert.pem"));
+
+// Shared across all MqttService instances within a process so commands don't
+// reset to 0 and collide.
+let globalSequenceId = 0;
+function nextSequenceId() {
+    globalSequenceId = (globalSequenceId + 1) % 1_000_000;
+    return globalSequenceId.toString();
+}
 
 /**
- * MQTT service for communicating with Bambu Lab printers
- * Handles connection management, message publishing, and subscription
+ * MQTT service for communicating with Bambu Lab printers.
+ * Connections are cached per (address, deviceId); call closeAllConnections()
+ * before exit instead of calling client.end() inside individual operations.
  */
 class MqttService {
     constructor() {
-        this.clients = new Map(); // Store active connections
-        this.messageHandlers = new Map(); // Store message handlers
-        this.bblCA = fs.readFileSync(
-            path.join(__dirname, "../../utils/mqtt/ca_cert.pem")
-        );
-        this.sequenceId = 0; // Sequence ID counter for tracking requests
+        this.clients = new Map();
     }
 
-    /**
-     * Get next sequence ID
-     * @returns {string} Next sequence ID as string
-     */
-    getNextSequenceId() {
-        this.sequenceId = (this.sequenceId + 1) % 1000000; // Wrap around at 1M
-        return this.sequenceId.toString();
-    }
-
-    /**
-     * Get current sequence ID (without incrementing)
-     * @returns {number} Current sequence ID value
-     */
-    getCurrentSequenceId() {
-        return this.sequenceId;
-    }
-
-    /**
-     * Reset sequence ID counter
-     */
-    resetSequenceId() {
-        this.sequenceId = 0;
-    }
-
-    /**
-     * Connect to a printer via MQTT
-     * @param {string} address - Printer IP address
-     * @param {string} deviceId - Printer device ID
-     * @param {string} accessCode - Printer access code
-     * @returns {Promise<Object>} MQTT client instance
-     */
     async connect(address, deviceId, accessCode) {
-        const connectionKey = `${address}:${deviceId}`;
-
-        // Return existing connection if available
-        if (this.clients.has(connectionKey)) {
-            const client = this.clients.get(connectionKey);
-            if (client.connected) {
-                return client;
-            }
-        }
+        const key = `${address}:${deviceId}`;
+        const cached = this.clients.get(key);
+        if (cached && cached.connected) return cached;
 
         return new Promise((resolve, reject) => {
             const client = mqtt.connect({
@@ -68,511 +38,262 @@ class MqttService {
                 username: "bblp",
                 password: accessCode,
                 servername: deviceId,
-                ca: this.bblCA,
+                ca: CA_CERT,
             });
 
-            client.on("connect", () => {
-                this.clients.set(connectionKey, client);
+            const onError = (err) => {
+                client.removeListener("connect", onConnect);
+                reject(err);
+            };
+            const onConnect = () => {
+                client.removeListener("error", onError);
+                client.on("close", () => this.clients.delete(key));
+                this.clients.set(key, client);
                 resolve(client);
-            });
-
-            client.on("error", (error) => {
-                reject(error);
-            });
-
-            client.on("close", () => {
-                this.clients.delete(connectionKey);
-            });
-        });
-    }
-
-    /**
-     * Subscribe to a topic
-     * @param {Object} client - MQTT client
-     * @param {string} topic - Topic to subscribe to
-     * @returns {Promise<void>}
-     */
-    async subscribe(client, topic) {
-        return new Promise((resolve, reject) => {
-            client.subscribe(topic, (err) => {
-                if (err) reject(err);
-                else resolve();
-            });
-        });
-    }
-
-    /**
-     * Publish a message to a topic
-     * @param {Object} client - MQTT client
-     * @param {string} topic - Topic to publish to
-     * @param {Object|string} message - Message to publish
-     * @returns {Promise<void>}
-     */
-    async publish(client, topic, message) {
-        return new Promise((resolve, reject) => {
-            const payload =
-                typeof message === "string" ? message : JSON.stringify(message);
-            client.publish(topic, payload, (err) => {
-                if (err) reject(err);
-                else resolve();
-            });
-        });
-    }
-
-    /**
-     * Wait for a message on a specific topic
-     * @param {Object} client - MQTT client
-     * @param {string} topic - Topic to listen to
-     * @param {number} timeout - Timeout in milliseconds
-     * @returns {Promise<string>} Received message
-     */
-    async waitForMessage(client, topic, timeout = 10000) {
-        return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                reject(
-                    new Error(`Timeout waiting for message on topic: ${topic}`)
-                );
-            }, timeout);
-
-            const handler = (msgTopic, message) => {
-                if (msgTopic === topic) {
-                    clearTimeout(timer);
-                    client.removeListener("message", handler);
-                    resolve(message.toString());
-                }
             };
 
+            client.once("connect", onConnect);
+            client.once("error", onError);
+        });
+    }
+
+    subscribe(client, topic) {
+        return new Promise((resolve, reject) => {
+            client.subscribe(topic, (err) => (err ? reject(err) : resolve()));
+        });
+    }
+
+    publish(client, topic, message) {
+        return new Promise((resolve, reject) => {
+            const payload = typeof message === "string" ? message : JSON.stringify(message);
+            client.publish(topic, payload, (err) => (err ? reject(err) : resolve()));
+        });
+    }
+
+    /**
+     * Wait for the next message on `topic` for which `predicate(payload)` returns truthy.
+     * Always removes its listener and clears its timer (no leaks on timeout/resolve).
+     */
+    waitForMessage(client, topic, predicate, timeout = 10_000) {
+        return new Promise((resolve, reject) => {
+            const handler = (msgTopic, raw) => {
+                if (msgTopic !== topic) return;
+                let payload;
+                try {
+                    payload = JSON.parse(raw.toString());
+                } catch {
+                    return; // ignore non-JSON
+                }
+                if (!predicate(payload)) return;
+                cleanup();
+                resolve(payload);
+            };
+            const cleanup = () => {
+                clearTimeout(timer);
+                client.removeListener("message", handler);
+            };
+            const timer = setTimeout(() => {
+                cleanup();
+                reject(new Error(`Timeout waiting for matching message on ${topic}`));
+            }, timeout);
             client.on("message", handler);
         });
     }
 
     /**
-     * Send a command and wait for response
-     * @param {Object} client - MQTT client
-     * @param {string} deviceId - Device ID
-     * @param {Object} command - Command to send
-     * @param {string} responseTopic - Topic to listen for response
-     * @param {number} timeout - Timeout in milliseconds
-     * @param {boolean} validateSequenceId - Whether to validate response sequence ID
-     * @returns {Promise<Object>} Response data
+     * Publish a command and wait for its response.
+     *
+     * Matching strategy (most → least common):
+     *   - top-level key (`print`/`info`/`system`) of the request must appear in the response
+     *   - if `matchCommand` is set, the inner `command` field must equal it
+     *   - if `matchSequence` is true, sequence_id of the request must equal that of the response
+     *     (only when the response actually carries one — printers do not always echo it)
+     *
+     * Default is key-only matching, since most Bambu replies (notably the pushall status
+     * broadcast) do NOT echo the request's sequence_id — they carry the printer's own
+     * monotonically-increasing counter.
      */
-    async sendCommand(
-        client,
-        deviceId,
-        command,
-        responseTopic = null,
-        timeout = 10000,
-        validateSequenceId = false
-    ) {
+    async sendCommand(client, deviceId, command, opts = {}) {
+        const { timeout = 10_000, matchKey, matchCommand, matchSequence = false } = opts;
         const requestTopic = `device/${deviceId}/request`;
-        const reportTopic = responseTopic || `device/${deviceId}/report`;
+        const reportTopic = `device/${deviceId}/report`;
+        const expectedKey = matchKey || this.topLevelKey(command);
+        const requestSeq = matchSequence ? this.extractSequenceId(command) : null;
 
-        // Extract sequence ID for validation
-        const requestSequenceId = this.extractSequenceId(command);
-
-        // Subscribe to response topic
         await this.subscribe(client, reportTopic);
 
-        // Send command
-        await this.publish(client, requestTopic, command);
-
-        // Wait for response
-        const response = await this.waitForMessage(
-            client,
-            reportTopic,
-            timeout
-        );
-        const responseData = JSON.parse(response);
-
-        // Validate sequence ID if requested
-        if (validateSequenceId && requestSequenceId) {
-            const responseSequenceId = this.extractSequenceId(responseData);
-            if (requestSequenceId !== responseSequenceId) {
-                throw new Error(
-                    `Sequence ID mismatch: expected ${requestSequenceId}, got ${responseSequenceId}`
-                );
+        const predicate = (payload) => {
+            if (expectedKey && !payload[expectedKey]) return false;
+            if (matchCommand && payload[expectedKey].command !== matchCommand) return false;
+            if (requestSeq != null) {
+                const responseSeq = this.extractSequenceId(payload);
+                if (responseSeq != null && String(responseSeq) !== String(requestSeq)) return false;
             }
-        }
-
-        return responseData;
-    }
-
-    /**
-     * Extract sequence ID from command or response
-     * @param {Object} data - Command or response data
-     * @returns {string|null} Sequence ID or null if not found
-     */
-    extractSequenceId(data) {
-        // Check common locations for sequence_id
-        if (data.info && data.info.sequence_id) {
-            return data.info.sequence_id;
-        }
-        if (data.print && data.print.sequence_id) {
-            return data.print.sequence_id;
-        }
-        if (data.system && data.system.sequence_id) {
-            return data.system.sequence_id;
-        }
-        
-        // Recursively search for sequence_id in any object
-        const findSequenceId = (obj) => {
-            if (typeof obj !== 'object' || obj === null) {
-                return null;
-            }
-            
-            if (obj.sequence_id !== undefined) {
-                return obj.sequence_id;
-            }
-            
-            for (const key in obj) {
-                if (typeof obj[key] === 'object' && obj[key] !== null) {
-                    const found = findSequenceId(obj[key]);
-                    if (found !== null) {
-                        return found;
-                    }
-                }
-            }
-            return null;
+            return true;
         };
-        
-        return findSequenceId(data);
+
+        const wait = this.waitForMessage(client, reportTopic, predicate, timeout);
+        await this.publish(client, requestTopic, command);
+        return wait;
     }
 
     /**
-     * Get comprehensive printer status
-     * @param {string} address - Printer IP address
-     * @param {string} deviceId - Printer device ID
-     * @param {string} accessCode - Printer access code
-     * @returns {Promise<Object>} Printer status
+     * Subscribe to the report topic and call `onPayload(parsedJson)` for every message.
+     * Returns an unsubscribe function.
      */
+    async streamReports(client, deviceId, onPayload) {
+        const reportTopic = `device/${deviceId}/report`;
+        await this.subscribe(client, reportTopic);
+        const handler = (msgTopic, raw) => {
+            if (msgTopic !== reportTopic) return;
+            try {
+                onPayload(JSON.parse(raw.toString()));
+            } catch {
+                // ignore
+            }
+        };
+        client.on("message", handler);
+        return () => client.removeListener("message", handler);
+    }
+
+    topLevelKey(command) {
+        if (!command || typeof command !== "object") return null;
+        for (const k of ["print", "info", "system", "pushing"]) {
+            if (command[k]) return k === "pushing" ? "print" : k;
+        }
+        return null;
+    }
+
+    extractSequenceId(data) {
+        if (!data || typeof data !== "object") return null;
+        for (const k of ["info", "print", "system", "pushing"]) {
+            if (data[k] && data[k].sequence_id != null) return data[k].sequence_id;
+        }
+        return data.sequence_id != null ? data.sequence_id : null;
+    }
+
+    addSequenceIdIfMissing(command) {
+        const out = JSON.parse(JSON.stringify(command));
+        for (const k of ["print", "info", "system", "pushing"]) {
+            if (out[k] && typeof out[k] === "object" && out[k].sequence_id == null) {
+                out[k].sequence_id = nextSequenceId();
+                return out;
+            }
+        }
+        return out;
+    }
+
     async getPrinterStatus(address, deviceId, accessCode) {
         const client = await this.connect(address, deviceId, accessCode);
-
-        const command = {
+        return this.sendCommand(client, deviceId, {
             pushing: {
-                sequence_id: this.getNextSequenceId(),
+                sequence_id: nextSequenceId(),
                 command: "pushall",
                 version: 1,
-                push_target: 1
+                push_target: 1,
             },
-        };
-
-        const response = await this.sendCommand(client, deviceId, command);
-        client.end();
-
-        return response;
+        });
     }
 
-    /**
-     * Get printer version
-     * @param {string} address - Printer IP address
-     * @param {string} deviceId - Printer device ID
-     * @param {string} accessCode - Printer access code
-     * @returns {Promise<string>} Software version
-     */
     async getPrinterVersion(address, deviceId, accessCode) {
         const client = await this.connect(address, deviceId, accessCode);
-
-        const sequenceId = this.getNextSequenceId();
-        const command = {
-            info: {
-                sequence_id: sequenceId,
-                command: "get_version",
-            },
-        };
-
-        console.log(
-            `🔢 Using sequence ID: ${sequenceId} for get_version command`
-        );
-        const response = await this.sendCommand(client, deviceId, command);
-        client.end();
-
+        const response = await this.sendCommand(client, deviceId, {
+            info: { sequence_id: nextSequenceId(), command: "get_version" },
+        }, { matchCommand: "get_version" });
         return response.info.module[0].sw_ver;
     }
 
     /**
-     * Start a print job
-     * @param {string} address - Printer IP address
-     * @param {string} deviceId - Printer device ID
-     * @param {string} accessCode - Printer access code
-     * @param {string} fileName - Name of the file to print
-     * @returns {Promise<Object>} Print start response
+     * Send a `print` command (start/stop/pause/resume/load_filament/unload_filament/...).
+     * `extra` is merged into the print object.
      */
+    async sendPrintCommand(address, deviceId, accessCode, command, extra = {}) {
+        const client = await this.connect(address, deviceId, accessCode);
+        return this.sendCommand(client, deviceId, {
+            print: { sequence_id: nextSequenceId(), command, ...extra },
+        });
+    }
+
     async startPrint(address, deviceId, accessCode, fileName) {
-        const client = await this.connect(address, deviceId, accessCode);
-
-        const command = {
-            print: {
-                sequence_id: this.getNextSequenceId(),
-                command: "start",
-                file: fileName,
-            },
-        };
-
-        const response = await this.sendCommand(client, deviceId, command);
-        client.end();
-
-        return response;
+        return this.sendPrintCommand(address, deviceId, accessCode, "start", { file: fileName });
     }
 
-    /**
-     * Stop a print job
-     * @param {string} address - Printer IP address
-     * @param {string} deviceId - Printer device ID
-     * @param {string} accessCode - Printer access code
-     * @returns {Promise<Object>} Stop response
-     */
     async stopPrint(address, deviceId, accessCode) {
-        const client = await this.connect(address, deviceId, accessCode);
-
-        const command = {
-            print: {
-                sequence_id: this.getNextSequenceId(),
-                command: "stop",
-            },
-        };
-
-        const response = await this.sendCommand(client, deviceId, command);
-        client.end();
-
-        return response;
+        return this.sendPrintCommand(address, deviceId, accessCode, "stop");
     }
 
-    /**
-     * Pause a print job
-     * @param {string} address - Printer IP address
-     * @param {string} deviceId - Printer device ID
-     * @param {string} accessCode - Printer access code
-     * @returns {Promise<Object>} Pause response
-     */
     async pausePrint(address, deviceId, accessCode) {
-        const client = await this.connect(address, deviceId, accessCode);
-
-        const command = {
-            print: {
-                sequence_id: this.getNextSequenceId(),
-                command: "pause",
-            },
-        };
-
-        const response = await this.sendCommand(client, deviceId, command);
-        client.end();
-
-        return response;
+        return this.sendPrintCommand(address, deviceId, accessCode, "pause");
     }
 
-    /**
-     * Resume a print job
-     * @param {string} address - Printer IP address
-     * @param {string} deviceId - Printer device ID
-     * @param {string} accessCode - Printer access code
-     * @returns {Promise<Object>} Resume response
-     */
     async resumePrint(address, deviceId, accessCode) {
-        const client = await this.connect(address, deviceId, accessCode);
-
-        const command = {
-            print: {
-                sequence_id: this.getNextSequenceId(),
-                command: "resume",
-            },
-        };
-
-        const response = await this.sendCommand(client, deviceId, command);
-        client.end();
-
-        return response;
+        return this.sendPrintCommand(address, deviceId, accessCode, "resume");
     }
 
-    /**
-     * Load filament
-     * @param {string} address - Printer IP address
-     * @param {string} deviceId - Printer device ID
-     * @param {string} accessCode - Printer access code
-     * @param {string} target - Target temperature (optional)
-     * @returns {Promise<Object>} Load filament response
-     */
-    async loadFilament(address, deviceId, accessCode, target = null) {
-        const client = await this.connect(address, deviceId, accessCode);
-
-        const command = {
-            print: {
-                sequence_id: this.getNextSequenceId(),
-                command: "load_filament",
-            },
-        };
-
-        // Add target temperature if provided
-        if (target) {
-            command.print.target = target;
-        }
-
-        const response = await this.sendCommand(client, deviceId, command);
-        client.end();
-
-        return response;
-    }
-
-    /**
-     * Unload filament
-     * @param {string} address - Printer IP address
-     * @param {string} deviceId - Printer device ID
-     * @param {string} accessCode - Printer access code
-     * @returns {Promise<Object>} Unload filament response
-     */
     async unloadFilament(address, deviceId, accessCode) {
-        const client = await this.connect(address, deviceId, accessCode);
-
-        const command = {
-            print: {
-                sequence_id: this.getNextSequenceId(),
-                command: "unload_filament",
-            },
-        };
-
-        const response = await this.sendCommand(client, deviceId, command);
-        client.end();
-
-        return response;
+        return this.sendPrintCommand(address, deviceId, accessCode, "unload_filament");
     }
 
-    /**
-     * Skip objects during printing
-     * @param {string} address - Printer IP address
-     * @param {string} deviceId - Printer device ID
-     * @param {string} accessCode - Printer access code
-     * @param {Array} objectIds - Array of object IDs to skip
-     * @returns {Promise<Object>} Skip objects response
-     */
     async skipObjects(address, deviceId, accessCode, objectIds) {
-        const client = await this.connect(address, deviceId, accessCode);
-
-        // Validate object IDs
         if (!Array.isArray(objectIds) || objectIds.length === 0) {
             throw new Error("Object IDs array is required and cannot be empty");
         }
-
-        // Validate each object ID
-        objectIds.forEach((id, index) => {
-            if (typeof id !== 'string' && typeof id !== 'number') {
-                throw new Error(`Invalid object ID at index ${index}: must be string or number`);
+        for (const [i, id] of objectIds.entries()) {
+            if (typeof id !== "string" && typeof id !== "number") {
+                throw new Error(`Invalid object ID at index ${i}: must be string or number`);
             }
-        });
-
-        const command = {
-            print: {
-                sequence_id: "0",
-                command: "skip_objects",
-                obj_list: objectIds
-            }
-        };
-
-        const response = await this.sendCommand(client, deviceId, command, null, 10000, false);
-        client.end();
-
-        return response;
+        }
+        return this.sendPrintCommand(address, deviceId, accessCode, "skip_objects", { obj_list: objectIds });
     }
 
     /**
-     * Close all active connections
+     * LED control. node is typically "work_light" or "chamber_light".
+     * mode is one of "on" | "off" | "flashing".
      */
+    async setLight(address, deviceId, accessCode, node, mode) {
+        const client = await this.connect(address, deviceId, accessCode);
+        return this.sendCommand(client, deviceId, {
+            system: {
+                sequence_id: nextSequenceId(),
+                command: "ledctrl",
+                led_node: node,
+                led_mode: mode,
+                led_on_time: 500,
+                led_off_time: 500,
+                loop_times: 0,
+                interval_time: 0,
+            },
+        });
+    }
+
+    async sendCustomCommand(address, deviceId, accessCode, command, { validateSequenceId = true, timeout = 10_000 } = {}) {
+        const client = await this.connect(address, deviceId, accessCode);
+        const withSeq = this.addSequenceIdIfMissing(command);
+        logger.debug("Sending custom command", { command: withSeq, deviceId });
+        const response = await this.sendCommand(client, deviceId, withSeq, {
+            timeout,
+            matchSequence: validateSequenceId,
+        });
+        logger.debug("Custom command response", { response, deviceId });
+        return response;
+    }
+
     closeAllConnections() {
-        for (const [key, client] of this.clients) {
-            if (client.connected) {
-                client.end();
+        for (const client of this.clients.values()) {
+            try {
+                client.end(true);
+            } catch {
+                // ignore
             }
         }
         this.clients.clear();
     }
 
-    /**
-     * Get connection status
-     * @param {string} address - Printer IP address
-     * @param {string} deviceId - Printer device ID
-     * @returns {boolean} Connection status
-     */
     isConnected(address, deviceId) {
-        const connectionKey = `${address}:${deviceId}`;
-        const client = this.clients.get(connectionKey);
-        return client && client.connected;
-    }
-
-    /**
-     * Send custom MQTT command to printer
-     * @param {string} address - Printer IP address
-     * @param {string} deviceId - Printer device ID
-     * @param {string} accessCode - Printer access code
-     * @param {Object} command - Custom command object
-     * @param {Object} options - Command options
-     * @returns {Promise<Object>} Command response
-     */
-    async sendCustomCommand(address, deviceId, accessCode, command, options = {}) {
-        const client = await this.connect(address, deviceId, accessCode);
-
-        // Add sequence ID if not present
-        const commandWithSequence = this.addSequenceIdIfMissing(command);
-        
-        // Log the command being sent
-        const logger = require("../../utils/logger");
-        logger.info("Sending custom command", {
-            command: commandWithSequence,
-            deviceId: deviceId
-        });
-
-        // Determine if we should validate sequence ID
-        const validateSequenceId = options.validateSequenceId !== false; // Default to true unless explicitly disabled
-
-        const response = await this.sendCommand(
-            client, 
-            deviceId, 
-            commandWithSequence,
-            null,
-            10000,
-            validateSequenceId
-        );
-        
-        // Log the response
-        logger.info("Received custom command response", {
-            response: response,
-            deviceId: deviceId
-        });
-        
-        client.end();
-        return response;
-    }
-
-    /**
-     * Add sequence ID to command if missing
-     * @param {Object} command - Command object
-     * @returns {Object} Command with sequence ID
-     */
-    addSequenceIdIfMissing(command) {
-        // Deep clone the command to avoid modifying the original
-        const commandCopy = JSON.parse(JSON.stringify(command));
-        
-        // Find the first object that has a 'sequence_id' field or should have one
-        const addSequenceId = (obj) => {
-            for (const key in obj) {
-                if (typeof obj[key] === 'object' && obj[key] !== null) {
-                    // Check if this object should have a sequence_id (common command objects)
-                    if (key === 'print' || key === 'info' || key === 'system') {
-                        if (!obj[key].sequence_id) {
-                            obj[key].sequence_id = this.getNextSequenceId();
-                        }
-                        return true;
-                    }
-                    // Recursively check nested objects
-                    if (addSequenceId(obj[key])) {
-                        return true;
-                    }
-                }
-            }
-            return false;
-        };
-
-        addSequenceId(commandCopy);
-        return commandCopy;
+        const client = this.clients.get(`${address}:${deviceId}`);
+        return !!(client && client.connected);
     }
 }
 
 module.exports = MqttService;
+module.exports.nextSequenceId = nextSequenceId;

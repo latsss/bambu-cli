@@ -1,6 +1,8 @@
 const JSZip = require('jszip');
-const { DOMParser } = require('xmldom');
+const { DOMParser } = require('@xmldom/xmldom');
 const chalk = require('chalk');
+const { PNG } = require('pngjs');
+const logger = require('./logger');
 
 /**
  * 3MF file parser utility
@@ -42,18 +44,11 @@ class ThreeMFParser {
             this.zip = new JSZip();
             await this.zip.loadAsync(buffer);
 
-            // First, examine the ZIP structure
             const fileNames = Object.keys(this.zip.files);
-            console.log("Files in 3MF:", fileNames);
+            logger.debug("3MF contents", { fileNames });
 
-            // Try to find metadata files
-            const metadataFiles = fileNames.filter(name => name.includes('Metadata') || name.includes('metadata'));
             const plateJsonFiles = fileNames.filter(name => name.includes('plate') && name.endsWith('.json'));
             const sliceFiles = fileNames.filter(name => name.includes('slice') || name.includes('Slice'));
-
-            console.log("Metadata files:", metadataFiles);
-            console.log("Plate JSON files:", plateJsonFiles);
-            console.log("Slice files:", sliceFiles);
 
             // Parse plate JSON file (this is the main data we need)
             if (plateJsonFiles.length > 0) {
@@ -358,6 +353,213 @@ class ThreeMFParser {
         }
 
         return result;
+    }
+
+    /**
+     * Locate a per-plate top-down PNG inside the loaded 3MF.
+     * Prefers `Metadata/pick_<N>.png` (per-object segmentation mask) then falls back
+     * to `Metadata/top_<N>.png` (rendered top-down view). Returns null if neither found.
+     *
+     * @param {number} plateIndex - 1-based plate index from plate JSON
+     * @returns {Promise<{name: string, kind: 'pick'|'top', png: import('pngjs').PNG} | null>}
+     */
+    async extractPlatePng(plateIndex) {
+        if (!this.zip) return null;
+        const names = Object.keys(this.zip.files);
+        const lower = (s) => s.toLowerCase();
+
+        const findOne = (predicate) => names.find((n) => predicate(lower(n)));
+        const pickName =
+            findOne((n) => n.endsWith(`pick_${plateIndex}.png`)) ||
+            findOne((n) => n.endsWith("pick.png"));
+        const topName =
+            findOne((n) => n.endsWith(`top_${plateIndex}.png`)) ||
+            findOne((n) => n.endsWith("top.png"));
+
+        const chosen = pickName ? { name: pickName, kind: "pick" } :
+                       topName  ? { name: topName,  kind: "top"  } : null;
+        if (!chosen) return null;
+
+        const buf = await this.zip.file(chosen.name).async("nodebuffer");
+        const png = PNG.sync.read(buf);
+        return { ...chosen, png };
+    }
+
+    /**
+     * Render an ASCII view of objects using the segmentation/top-down PNG from the 3MF.
+     * For `pick` PNGs each distinct color is its own object — we colorize and try to label.
+     * For `top` PNGs we just threshold luminance and render silhouettes (no per-object colors).
+     */
+    renderShapeAscii(objects, plateImage, { width = 60, colored = true, label = true } = {}) {
+        if (!plateImage || !plateImage.png) return null;
+        const { png, kind } = plateImage;
+        const { width: pw, height: ph, data } = png;
+
+        // Terminal cells are roughly 2:1 (tall:wide), so squash Y by half.
+        const cellW = pw / width;
+        const cellH = cellW * 2;
+        const height = Math.max(1, Math.floor(ph / cellH));
+
+        const isBackground = (r, g, b, a) => a < 16 || (r < 16 && g < 16 && b < 16);
+
+        // --- step 1: downsample to a grid of RGBA cells via center-pixel sampling
+        const grid = new Array(height);
+        for (let cy = 0; cy < height; cy++) {
+            grid[cy] = new Array(width);
+            for (let cx = 0; cx < width; cx++) {
+                const px = Math.min(pw - 1, Math.floor((cx + 0.5) * cellW));
+                const py = Math.min(ph - 1, Math.floor((cy + 0.5) * cellH));
+                const idx = (py * pw + px) * 4;
+                grid[cy][cx] = [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
+            }
+        }
+
+        // --- step 2: collect distinct non-background colors with centroids
+        const regions = new Map(); // colorKey -> {r,g,b,sumX,sumY,count}
+        for (let y = 0; y < ph; y++) {
+            for (let x = 0; x < pw; x++) {
+                const i = (y * pw + x) * 4;
+                const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+                if (isBackground(r, g, b, a)) continue;
+                // pick PNGs use a small number of solid colors; quantize to be tolerant of AA.
+                const qr = r & 0xF0, qg = g & 0xF0, qb = b & 0xF0;
+                const key = (qr << 16) | (qg << 8) | qb;
+                let region = regions.get(key);
+                if (!region) {
+                    region = { r: qr, g: qg, b: qb, sumX: 0, sumY: 0, count: 0 };
+                    regions.set(key, region);
+                }
+                region.sumX += x; region.sumY += y; region.count++;
+            }
+        }
+        // drop tiny noise regions (< 0.05% of image)
+        const minCount = Math.max(4, Math.floor(pw * ph * 0.0005));
+        const significant = [...regions.entries()].filter(([, r]) => r.count >= minCount);
+
+        // --- step 3: match colors to object IDs (only useful for pick PNGs)
+        const colorKeyToObject = new Map();
+        if (kind === "pick" && objects.length > 0 && significant.length > 0) {
+            const objWithBBox = objects.filter((o) => o.boundingBox);
+            if (objWithBBox.length > 0) {
+                // Compute occupied pixel bounding box across detected regions.
+                let pminX = Infinity, pminY = Infinity, pmaxX = -Infinity, pmaxY = -Infinity;
+                for (const [, r] of significant) {
+                    const cx = r.sumX / r.count, cy = r.sumY / r.count;
+                    pminX = Math.min(pminX, cx); pminY = Math.min(pminY, cy);
+                    pmaxX = Math.max(pmaxX, cx); pmaxY = Math.max(pmaxY, cy);
+                }
+                // mm-space bbox across known objects
+                let mminX = Infinity, mminY = Infinity, mmaxX = -Infinity, mmaxY = -Infinity;
+                for (const o of objWithBBox) {
+                    const [x1, y1] = o.boundingBox.min;
+                    const [x2, y2] = o.boundingBox.max;
+                    mminX = Math.min(mminX, x1); mminY = Math.min(mminY, y1);
+                    mmaxX = Math.max(mmaxX, x2); mmaxY = Math.max(mmaxY, y2);
+                }
+                // Object centroids normalized to [0,1] in mm-space.
+                const objCentroids = objWithBBox.map((o) => {
+                    const cx = (o.boundingBox.min[0] + o.boundingBox.max[0]) / 2;
+                    const cy = (o.boundingBox.min[1] + o.boundingBox.max[1]) / 2;
+                    return {
+                        obj: o,
+                        nx: (cx - mminX) / Math.max(1e-6, mmaxX - mminX),
+                        ny: (cy - mminY) / Math.max(1e-6, mmaxY - mminY),
+                    };
+                });
+                // Region centroids normalized to [0,1] in pixel-space.
+                const regionCentroids = significant.map(([key, r]) => ({
+                    key, r: r.r, g: r.g, b: r.b,
+                    nx: (r.sumX / r.count - pminX) / Math.max(1e-6, pmaxX - pminX),
+                    ny: (r.sumY / r.count - pminY) / Math.max(1e-6, pmaxY - pminY),
+                }));
+
+                // Try identity and Y-flip; pick assignment with smaller total distance.
+                const assign = (flipY) => {
+                    const taken = new Set();
+                    const out = new Map();
+                    let total = 0;
+                    for (const oc of objCentroids) {
+                        let best = null, bestD = Infinity;
+                        for (const rc of regionCentroids) {
+                            if (taken.has(rc.key)) continue;
+                            const ry = flipY ? 1 - rc.ny : rc.ny;
+                            const dx = oc.nx - rc.nx, dy = oc.ny - ry;
+                            const d = dx * dx + dy * dy;
+                            if (d < bestD) { bestD = d; best = rc; }
+                        }
+                        if (best) { taken.add(best.key); out.set(best.key, oc.obj); total += bestD; }
+                    }
+                    return { out, total };
+                };
+                const a = assign(false);
+                const b = assign(true);
+                const winner = b.total < a.total ? b : a;
+                for (const [k, v] of winner.out) colorKeyToObject.set(k, v);
+            }
+        }
+
+        // --- step 4: pick a chalk color per object/region
+        const palette = [
+            chalk.red, chalk.green, chalk.blue, chalk.yellow,
+            chalk.magenta, chalk.cyan, chalk.redBright, chalk.greenBright,
+            chalk.blueBright, chalk.yellowBright, chalk.magentaBright, chalk.cyanBright,
+        ];
+        const objectIdToColorFn = new Map();
+        let paletteIdx = 0;
+        const colorForObject = (obj) => {
+            if (!objectIdToColorFn.has(obj.id)) {
+                objectIdToColorFn.set(obj.id, palette[paletteIdx++ % palette.length]);
+            }
+            return objectIdToColorFn.get(obj.id);
+        };
+        const colorKeyToFn = new Map();
+        for (const [key] of significant) {
+            const obj = colorKeyToObject.get(key);
+            colorKeyToFn.set(key, obj ? colorForObject(obj) : palette[paletteIdx++ % palette.length]);
+        }
+
+        // --- step 5: render
+        const lines = [];
+        const top = "┌" + "─".repeat(width) + "┐";
+        const bot = "└" + "─".repeat(width) + "┘";
+        lines.push(top);
+        for (let cy = 0; cy < height; cy++) {
+            let row = "│";
+            for (let cx = 0; cx < width; cx++) {
+                const [r, g, b, a] = grid[cy][cx];
+                if (isBackground(r, g, b, a)) { row += " "; continue; }
+                if (kind === "pick") {
+                    const key = ((r & 0xF0) << 16) | ((g & 0xF0) << 8) | (b & 0xF0);
+                    const fn = colorKeyToFn.get(key);
+                    const ch = "█";
+                    row += colored && fn ? fn(ch) : ch;
+                } else {
+                    // top.png: pick a shading char from luminance
+                    const lum = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
+                    const ch = lum > 0.66 ? "█" : lum > 0.33 ? "▓" : "░";
+                    row += ch;
+                }
+            }
+            row += "│";
+            lines.push(row);
+        }
+        lines.push(bot);
+
+        if (label) {
+            lines.push("");
+            lines.push(`📋 Object List (${kind} mask${kind === "top" ? ", silhouettes only" : ""}):`);
+            for (const obj of objects) {
+                const fn = colored ? objectIdToColorFn.get(obj.id) : null;
+                const txt = `   ${obj.id}: ${obj.name}`;
+                lines.push(fn ? fn(txt) : txt);
+            }
+            const unmatched = significant.length - colorKeyToObject.size;
+            if (kind === "pick" && unmatched > 0) {
+                lines.push(chalk.gray(`   (${unmatched} detected region${unmatched === 1 ? "" : "s"} could not be matched to a known object)`));
+            }
+        }
+
+        return lines.join("\n");
     }
 
     /**

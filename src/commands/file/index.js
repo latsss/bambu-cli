@@ -1,7 +1,5 @@
-const LsCommand = require("./ls");
-const PullCommand = require("./pull");
- 
 module.exports = {
-    LsCommand,
-    PullCommand
-}; 
+    LsCommand: require("./ls"),
+    PullCommand: require("./pull"),
+    PushCommand: require("./push"),
+};

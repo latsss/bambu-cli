@@ -1,11 +1,10 @@
-const CommandCommand = require("./command");
-const StatusCommand = require("./status");
-const GetObjectsCommand = require("./get-objects");
-const SkipCommand = require("./skip");
-
 module.exports = {
-    CommandCommand,
-    StatusCommand,
-    GetObjectsCommand,
-    SkipCommand
-}; 
+    CommandCommand: require("./command"),
+    StatusCommand: require("./status"),
+    GetObjectsCommand: require("./get-objects"),
+    SkipCommand: require("./skip"),
+    PrintControlCommand: require("./control"),
+    StartCommand: require("./start"),
+    LightCommand: require("./light"),
+    MonitorCommand: require("./monitor"),
+};

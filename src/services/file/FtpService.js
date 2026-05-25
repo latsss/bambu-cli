@@ -151,6 +151,23 @@ class FtpService {
     }
 
     /**
+     * Upload a local file to the printer.
+     * @param {string} localPath - Local file path to upload
+     * @param {string} remotePath - Destination path on printer
+     * @returns {Promise<void>}
+     */
+    async uploadFile(localPath, remotePath) {
+        if (!this.connected || !this.client) {
+            throw new Error("Not connected to printer");
+        }
+        try {
+            await this.client.uploadFrom(localPath, remotePath);
+        } catch (error) {
+            throw new Error(`Failed to upload file: ${error.message}`);
+        }
+    }
+
+    /**
      * Check if connected
      * @returns {boolean} Connection status
      */

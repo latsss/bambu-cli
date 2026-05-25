@@ -80,6 +80,12 @@ Logs always go to stderr; `--json` keeps stdout clean for piping into `jq`/scrip
 - Tested with A1 and A1 mini.
 - `fs pull` refuses to write outside the current working directory unless you pass an
   absolute local path or `--allow-outside`. Belt-and-suspenders against typos.
+- **Storage**: the printer's FTPS server only exposes the **USB/SD slot**. On models with
+  on-board internal storage (e.g. P2S), the internal store is not reachable through this
+  CLI — Bambu Studio uses a separate, undocumented mechanism for it.
+- TLS verification on MQTT is disabled by default because Bambu uses self-signed device
+  certs that vary across firmware. Auth is anchored in the access code. Set
+  `BAMBU_STRICT_TLS=1` to re-enable strict CA pinning (only works with older P1/A1 firmware).
 - For LAN+dev specifically, the same commands work — you just get more fields in `status` /
   `monitor` output.
 - Mostly vibe-coded, then mostly de-vibed.

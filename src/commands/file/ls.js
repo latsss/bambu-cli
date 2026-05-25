@@ -46,6 +46,9 @@ class LsCommand extends BaseCommand {
             }
         }
         out += `\nTotal: ${data.files.length} items`;
+        if (data.path === "/" && data.files.length === 0) {
+            out += "\n\nℹ️  The printer's FTPS server only exposes USB/SD storage. Empty root usually means no USB is inserted.\n   Internal storage (if your model has one) is not reachable through this interface.";
+        }
         return out;
     }
 }

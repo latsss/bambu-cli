@@ -38,7 +38,13 @@ class MqttService {
                 username: "bblp",
                 password: accessCode,
                 servername: deviceId,
+                // Bundled CA covers older P1/A1 firmware. Newer firmware (e.g. P2S on
+                // OS v3, X1 in LAN+dev) ships device certs signed by a different CA, so
+                // strict verification would reject them. We accept any cert: trust is
+                // anchored in the access-code password, the IP is on the user's LAN, and
+                // the FTP path already does the same. Set BAMBU_STRICT_TLS=1 to override.
                 ca: CA_CERT,
+                rejectUnauthorized: process.env.BAMBU_STRICT_TLS === "1",
             });
 
             const onError = (err) => {

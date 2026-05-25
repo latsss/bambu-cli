@@ -18,8 +18,10 @@ jobs:
         include:
           - os: macos-14
             asset: bambu-cli-darwin-arm64
-          - os: macos-13
+            cross_node: darwin-arm64
+          - os: macos-14
             asset: bambu-cli-darwin-x64
+            cross_node: darwin-x64
           - os: ubuntu-latest
             asset: bambu-cli-linux-x64
           - os: windows-latest
@@ -34,6 +36,20 @@ jobs:
 
       - name: Install dependencies
         run: npm install
+
+      # For macOS we build both arm64 and x64 on the arm64 runner by feeding the build
+      # script a Node binary of the target arch as the SEA base. Injection and ad-hoc
+      # codesigning are arch-agnostic so this works fine cross-arch.
+      - name: Download target Node (macOS cross-build)
+        if: matrix.cross_node != ''
+        shell: bash
+        run: |
+          NODE_VER=$(node --version)
+          archive="node-${NODE_VER}-${{ matrix.cross_node }}.tar.gz"
+          curl -fsSL "https://nodejs.org/dist/${NODE_VER}/${archive}" -o node.tar.gz
+          mkdir node-target
+          tar -xzf node.tar.gz --strip-components=1 -C node-target
+          echo "NODE_BIN=$PWD/node-target/bin/node" >> "$GITHUB_ENV"
 
       - name: Build SEA binary
         shell: bash

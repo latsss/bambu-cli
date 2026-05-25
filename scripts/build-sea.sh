@@ -13,7 +13,9 @@ cd "$ROOT"
 
 OS_RAW="$(uname -s)"
 ARCH="$(uname -m)"
-NODE_BIN="$(command -v node)"
+# NODE_BIN can be overridden (used by CI to cross-build for a different target arch
+# by pointing this at a downloaded node binary of the desired platform).
+NODE_BIN="${NODE_BIN:-$(command -v node)}"
 OUT_DIR="dist"
 OUT_BIN="$OUT_DIR/bambu-cli"
 

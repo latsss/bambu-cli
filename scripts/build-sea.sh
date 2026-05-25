@@ -4,7 +4,7 @@
 #
 # Output: dist/bambu-cli
 #
-# Requirements: Node 20+, npx postject (auto-fetched), codesign on macOS.
+# Requirements: Node 22+ (24 recommended), npx postject (auto-fetched), codesign on macOS.
 
 set -euo pipefail
 

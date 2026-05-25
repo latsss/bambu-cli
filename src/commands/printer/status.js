@@ -1,250 +1,162 @@
 const BaseCommand = require("../base/BaseCommand");
-const { getPrinter } = require("../../config/config");
-const MqttService = require("../../services/connection/MqttService");
+const PrinterManager = require("../../services/printer/PrinterManager");
+const { listPrinters } = require("../../config/config");
 
-/**
- * Printer status command
- * Gets comprehensive printer status via MQTT pushall command
- */
 class StatusCommand extends BaseCommand {
     constructor() {
         super("status", "Get comprehensive printer status");
-        this.mqttService = new MqttService();
     }
 
-    /**
-     * Validate command arguments
-     * @param {Object} args - Command arguments
-     * @param {Object} options - Command options
-     */
-    async validate(args, options) {
-        if (!args.printerName) {
-            throw new Error("Printer name is required");
+    async validate(args) {
+        if (!args.all && !args.printerName) {
+            throw new Error("Printer name is required (or pass --all)");
+        }
+    }
+
+    async run(args) {
+        if (args.all) {
+            const names = Object.keys(listPrinters());
+            if (names.length === 0) return { all: true, results: [] };
+            const results = await Promise.all(names.map(async (name) => {
+                const pm = new PrinterManager();
+                try {
+                    const status = await pm.getPrinterStatus(name);
+                    return { printer: name, ok: true, status };
+                } catch (error) {
+                    return { printer: name, ok: false, error: error.message };
+                } finally {
+                    pm.closeAllConnections();
+                }
+            }));
+            return { all: true, results };
         }
 
-        // Validate printer exists in config
+        const pm = new PrinterManager();
         try {
-            getPrinter(args.printerName);
-        } catch (error) {
-            throw new Error(`Printer '${args.printerName}' not found in configuration`);
+            const status = await pm.getPrinterStatus(args.printerName);
+            return { printer: args.printerName, status };
+        } finally {
+            pm.closeAllConnections();
         }
     }
 
-    /**
-     * Execute the status command
-     * @param {Object} args - Command arguments
-     * @param {Object} options - Command options
-     * @returns {Promise<Object>} Command result data
-     */
-    async run(args, options) {
-        const config = getPrinter(args.printerName);
-
-        try {
-            this.log("info", `Connecting to printer: ${args.printerName} (${config.address})`);
-            
-            this.log("info", "Requesting comprehensive printer status");
-            
-            const response = await this.mqttService.getPrinterStatus(
-                config.address,
-                config.deviceId,
-                config.accessCode
-            );
-
-            this.log("info", "Received printer status data");
-
-            return {
-                printer: args.printerName,
-                status: response,
-                timestamp: new Date().toISOString()
-            };
-        } catch (error) {
-            this.log("error", `Failed to get printer status: ${error.message}`);
-            throw error;
+    formatSuccess(data) {
+        if (data.all) {
+            if (data.results.length === 0) return "📋 No printers configured";
+            return data.results
+                .map((r) => r.ok ? this.formatStatus(r.printer, r.status.print) : `❌ ${r.printer}: ${r.error}`)
+                .join("\n\n");
         }
+        const print = data.status && data.status.print;
+        if (!print) return `❌ Invalid status response from ${data.printer}`;
+        return this.formatStatus(data.printer, print);
     }
 
-    /**
-     * Format the command result for display
-     * @param {Object} result - Command result
-     * @returns {string} Formatted result
-     */
-    formatResult(result) {
-        if (!result.success) {
-            return `❌ Failed to get printer status: ${result.error.message}`;
-        }
-
-        const { printer, status } = result.data;
-        const print = status.print;
-        
-        if (!print) {
-            return `❌ Invalid status response from ${printer}`;
-        }
-
-        return this.formatStatus(printer, print);
-    }
-
-    /**
-     * Format printer status for display
-     * @param {string} printer - Printer name
-     * @param {Object} print - Print status object
-     * @returns {string} Formatted status
-     */
     formatStatus(printer, print) {
-        let output = `🖨️  Printer Status: ${printer}\n`;
-        output += `═`.repeat(50) + `\n\n`;
+        const line = "═".repeat(50);
+        let out = `🖨️  Printer Status: ${printer}\n${line}\n\n`;
 
-        // Basic Status
-        output += `📊 Basic Status:\n`;
-        output += `   State: ${this.getStateIcon(print.gcode_state)} ${print.gcode_state}\n`;
-        output += `   Online: ${print.online ? '🟢 Yes' : '🔴 No'}\n`;
-        output += `   WiFi: ${print.wifi_signal || 'Unknown'}\n`;
-        output += `   Lifecycle: ${print.lifecycle || 'Unknown'}\n`;
-        if (print.subtask_name) {
-            output += `   Current Job: ${print.subtask_name}\n`;
-        }
-        output += `\n`;
+        out += `📊 Basic Status:\n`;
+        out += `   State: ${this.getStateIcon(print.gcode_state)} ${print.gcode_state ?? "Unknown"}\n`;
+        if (print.online !== undefined) out += `   Online: ${print.online ? "🟢 Yes" : "🔴 No"}\n`;
+        if (print.wifi_signal !== undefined) out += `   WiFi: ${print.wifi_signal}\n`;
+        if (print.lifecycle) out += `   Lifecycle: ${print.lifecycle}\n`;
+        if (print.subtask_name) out += `   Current Job: ${print.subtask_name}\n`;
+        out += "\n";
 
-        // Temperatures
-        output += `🌡️  Temperatures:\n`;
-        output += `   Nozzle: ${print.nozzle_temper}°C / ${print.nozzle_target_temper}°C\n`;
-        output += `   Bed: ${print.bed_temper}°C / ${print.bed_target_temper}°C\n`;
-        if (print.chamber_temper !== undefined) {
-            output += `   Chamber: ${print.chamber_temper}°C\n`;
-        }
-        output += `\n`;
+        const tempLine = (label, cur, target) => {
+            if (cur === undefined && target === undefined) return null;
+            const c = cur !== undefined ? `${cur}°C` : "—";
+            const t = target !== undefined ? ` / ${target}°C` : "";
+            return `   ${label}: ${c}${t}\n`;
+        };
+        const temps = [
+            tempLine("Nozzle", print.nozzle_temper, print.nozzle_target_temper),
+            tempLine("Bed", print.bed_temper, print.bed_target_temper),
+            print.chamber_temper !== undefined ? `   Chamber: ${print.chamber_temper}°C\n` : null,
+        ].filter(Boolean);
+        if (temps.length) out += `🌡️  Temperatures:\n${temps.join("")}\n`;
 
-        // Fans
-        output += `💨 Fans:\n`;
-        output += `   Part Cooling: ${print.cooling_fan_speed}%\n`;
-        output += `   Heatbreak: ${print.heatbreak_fan_speed}%\n`;
-        if (print.big_fan1_speed !== undefined) {
-            output += `   Auxiliary: ${print.big_fan1_speed}%\n`;
-        }
-        if (print.big_fan2_speed !== undefined) {
-            output += `   Chamber: ${print.big_fan2_speed}%\n`;
-        }
-        output += `\n`;
+        const fans = [
+            print.cooling_fan_speed !== undefined ? `   Part Cooling: ${print.cooling_fan_speed}%\n` : null,
+            print.heatbreak_fan_speed !== undefined ? `   Heatbreak: ${print.heatbreak_fan_speed}%\n` : null,
+            print.big_fan1_speed !== undefined ? `   Auxiliary: ${print.big_fan1_speed}%\n` : null,
+            print.big_fan2_speed !== undefined ? `   Chamber: ${print.big_fan2_speed}%\n` : null,
+        ].filter(Boolean);
+        if (fans.length) out += `💨 Fans:\n${fans.join("")}\n`;
 
-        // Print Progress (if printing or recently finished)
-        if (print.gcode_state === "RUNNING" || print.gcode_state === "PAUSE" || 
-            (print.gcode_state === "FINISH" && print.mc_percent > 0)) {
-            output += `🖨️  Print Progress:\n`;
-            if (print.gcode_file) {
-                output += `   File: ${print.gcode_file}\n`;
-            }
-            output += `   Progress: ${print.mc_percent}%\n`;
-            if (print.mc_remaining_time > 0) {
-                output += `   Remaining Time: ${this.formatTime(print.mc_remaining_time)}\n`;
-            }
+        const isPrinting = print.gcode_state === "RUNNING" || print.gcode_state === "PAUSE" ||
+            (print.gcode_state === "FINISH" && print.mc_percent > 0);
+        if (isPrinting) {
+            out += `🖨️  Print Progress:\n`;
+            if (print.gcode_file) out += `   File: ${print.gcode_file}\n`;
+            if (print.mc_percent !== undefined) out += `   Progress: ${print.mc_percent}%\n`;
+            if (print.mc_remaining_time > 0) out += `   Remaining: ${this.formatTime(print.mc_remaining_time)}\n`;
             if (print.layer_num > 0 && print.total_layer_num > 0) {
-                output += `   Layer: ${print.layer_num}/${print.total_layer_num}\n`;
+                out += `   Layer: ${print.layer_num}/${print.total_layer_num}\n`;
             }
-            output += `   Speed: ${print.spd_mag}% (Level ${print.spd_lvl})\n`;
-            output += `\n`;
+            if (print.spd_mag !== undefined) out += `   Speed: ${print.spd_mag}% (Level ${print.spd_lvl})\n`;
+            out += "\n";
         }
 
-        // AMS Status (if available)
-        if (print.ams && print.ams.ams && print.ams.ams.length > 0) {
-            output += `🎨 AMS Status:\n`;
-            print.ams.ams.forEach((amsUnit, index) => {
-                output += `   AMS ${index + 1}: ${amsUnit.humidity}% humidity, ${amsUnit.temp}°C\n`;
-                if (amsUnit.tray && amsUnit.tray.length > 0) {
-                    amsUnit.tray.forEach((tray, trayIndex) => {
-                        if (tray.tray_type && tray.tray_type !== "") {
-                            output += `     Tray ${trayIndex + 1}: ${tray.tray_type} (${tray.remain}g remaining)\n`;
+        if (print.ams && Array.isArray(print.ams.ams) && print.ams.ams.length > 0) {
+            out += `🎨 AMS Status:\n`;
+            print.ams.ams.forEach((unit, i) => {
+                out += `   AMS ${i + 1}: ${unit.humidity ?? "?"}% humidity, ${unit.temp ?? "?"}°C\n`;
+                if (Array.isArray(unit.tray)) {
+                    unit.tray.forEach((tray, ti) => {
+                        if (tray.tray_type) {
+                            out += `     Tray ${ti + 1}: ${tray.tray_type} (${tray.remain ?? "?"}g remaining)\n`;
                         }
                     });
                 }
             });
-            output += `\n`;
+            out += "\n";
         }
 
-        // External Spool (vt_tray)
-        if (print.vt_tray && print.vt_tray.tray_type && print.vt_tray.tray_type !== "") {
-            output += `🎯 External Spool:\n`;
-            output += `   Type: ${print.vt_tray.tray_type}\n`;
-            if (print.vt_tray.tray_sub_brands) {
-                output += `   Brand: ${print.vt_tray.tray_sub_brands}\n`;
-            }
-            if (print.vt_tray.remain > 0) {
-                output += `   Remaining: ${print.vt_tray.remain}g\n`;
-            }
-            output += `\n`;
+        if (print.vt_tray && print.vt_tray.tray_type) {
+            out += `🎯 External Spool:\n`;
+            out += `   Type: ${print.vt_tray.tray_type}\n`;
+            if (print.vt_tray.tray_sub_brands) out += `   Brand: ${print.vt_tray.tray_sub_brands}\n`;
+            if (print.vt_tray.remain > 0) out += `   Remaining: ${print.vt_tray.remain}g\n`;
+            out += "\n";
         }
 
-        // Lights
-        if (print.lights_report && print.lights_report.length > 0) {
-            output += `💡 Lights:\n`;
-            print.lights_report.forEach(light => {
-                const icon = light.mode === 'on' ? '🟡' : light.mode === 'flashing' ? '⚡' : '⚫';
-                output += `   ${icon} ${light.node}: ${light.mode}\n`;
+        if (Array.isArray(print.lights_report) && print.lights_report.length > 0) {
+            out += `💡 Lights:\n`;
+            print.lights_report.forEach((light) => {
+                const icon = light.mode === "on" ? "🟡" : light.mode === "flashing" ? "⚡" : "⚫";
+                out += `   ${icon} ${light.node}: ${light.mode}\n`;
             });
-            output += `\n`;
+            out += "\n";
         }
 
-        // Errors (if any)
-        if (print.print_error !== 0 || (print.fail_reason && print.fail_reason !== "0")) {
-            output += `⚠️  Issues:\n`;
-            if (print.print_error !== 0) {
-                output += `   Print Error: ${print.print_error}\n`;
-            }
-            if (print.fail_reason && print.fail_reason !== "0") {
-                output += `   Fail Reason: ${print.fail_reason}\n`;
-            }
-            output += `\n`;
+        if (print.print_error !== undefined && print.print_error !== 0) {
+            out += `⚠️  Print Error: ${print.print_error}\n\n`;
+        }
+        if (Array.isArray(print.hms) && print.hms.length > 0) {
+            out += `🔧 HMS Errors:\n`;
+            print.hms.forEach((h) => { out += `   ${h.attr ?? ""} ${h.code ?? ""}\n`; });
+            out += "\n";
         }
 
-        // HMS (Hardware Monitoring System) errors
-        if (print.hms && print.hms.length > 0) {
-            output += `🔧 HMS Errors:\n`;
-            print.hms.forEach(hms => {
-                output += `   ${hms.title}: ${hms.desc}\n`;
-            });
-            output += `\n`;
-        }
-
-        output += `═`.repeat(50) + `\n`;
-        output += `📅 Last Updated: ${new Date().toLocaleString()}\n`;
-
-        return output;
+        out += `${line}\n📅 Fetched: ${new Date().toLocaleString()}\n`;
+        return out;
     }
 
-    /**
-     * Get state icon
-     * @param {string} state - Printer state
-     * @returns {string} State icon
-     */
     getStateIcon(state) {
-        const icons = {
-            'IDLE': '🟢',
-            'RUNNING': '🟡',
-            'PRINTING': '🟡',
-            'PAUSE': '🟠',
-            'FINISH': '🟢',
-            'FAILED': '🔴',
-            'PREPARE': '🟡',
-            'SLICING': '🟡'
-        };
-        return icons[state] || '❓';
+        return {
+            IDLE: "🟢", RUNNING: "🟡", PRINTING: "🟡", PAUSE: "🟠",
+            FINISH: "🟢", FAILED: "🔴", PREPARE: "🟡", SLICING: "🟡",
+        }[state] || "❓";
     }
 
-    /**
-     * Format time in seconds to human readable format
-     * @param {number} seconds - Time in seconds
-     * @returns {string} Formatted time
-     */
     formatTime(seconds) {
-        if (!seconds || seconds === 0) return 'Unknown';
-        
-        const hours = Math.floor(seconds / 3600);
-        const minutes = Math.floor((seconds % 3600) / 60);
-        
-        if (hours > 0) {
-            return `${hours}h ${minutes}m`;
-        } else {
-            return `${minutes}m`;
-        }
+        if (!seconds) return "Unknown";
+        const h = Math.floor(seconds / 3600);
+        const m = Math.floor((seconds % 3600) / 60);
+        return h > 0 ? `${h}h ${m}m` : `${m}m`;
     }
 }
 
-module.exports = StatusCommand; 
+module.exports = StatusCommand;

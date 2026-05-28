@@ -62,10 +62,85 @@ class ThreeMFParser {
                 await this.parseSliceInfoFile(sliceFiles[0]);
             }
 
-            return this.getObjectInfo();
+            const info = this.getObjectInfo();
+            await this._reconcileInstancesAgainstPickPng(info);
+            return info;
         } catch (error) {
             throw new Error(`Failed to parse 3MF file: ${error.message}`);
         }
+    }
+
+    /**
+     * Newer OrcaSlicer (2.4+) lists only the source object in slice_info.config but
+     * the pick PNG encodes EVERY printed instance with a unique identify_id (the
+     * id channel pattern `id = r | g<<8 | b<<16` — see renderShapeAscii). When the
+     * pick PNG has more distinct instance ids than slice_info reports, fill in
+     * the gap so `skip` and the diagram see all of them. Each synthesized instance
+     * inherits the name (and best-effort metadata) of its source — the source
+     * being the largest-id slice_info object whose id <= the new id, or simply
+     * the first slice_info object when ids don't sort cleanly.
+     */
+    async _reconcileInstancesAgainstPickPng(info) {
+        if (!info || !info.objects || info.objects.length === 0) return;
+        let plate;
+        try {
+            plate = await this.extractPlatePng(info.plateIndex);
+        } catch {
+            return;
+        }
+        if (!plate || plate.kind !== "pick") return;
+
+        const { png } = plate;
+        const { width: pw, height: ph, data } = png;
+        const counts = new Map(); // id -> pixel count
+        for (let i = 0; i < data.length; i += 4) {
+            const a = data[i + 3];
+            if (a < 16) continue;
+            const r = data[i], g = data[i + 1], b = data[i + 2];
+            if (r < 16 && g < 16 && b < 16) continue;
+            const id = r | (g << 8) | (b << 16);
+            counts.set(id, (counts.get(id) || 0) + 1);
+        }
+        const minCount = Math.max(50, Math.floor(pw * ph * 0.0005));
+        const pngIds = [...counts.entries()]
+            .filter(([, c]) => c >= minCount)
+            .map(([id]) => id);
+        if (pngIds.length === 0) return;
+
+        const knownIds = new Set();
+        for (const o of info.objects) {
+            const n = typeof o.id === "string" ? parseInt(o.id, 10) : o.id;
+            if (Number.isFinite(n)) knownIds.add(n);
+        }
+        const missing = pngIds.filter((id) => !knownIds.has(id));
+        if (missing.length === 0) return;
+
+        // Pick a name source per missing id: largest known id <= missing id;
+        // falls back to the first known object if no such predecessor exists.
+        const sortedKnown = [...info.objects]
+            .map((o) => ({ obj: o, n: typeof o.id === "string" ? parseInt(o.id, 10) : o.id }))
+            .filter((x) => Number.isFinite(x.n))
+            .sort((a, b) => a.n - b.n);
+        const nameFor = (id) => {
+            let pick = sortedKnown[0]?.obj;
+            for (const k of sortedKnown) {
+                if (k.n <= id) pick = k.obj;
+                else break;
+            }
+            return pick;
+        };
+
+        for (const id of missing.sort((a, b) => a - b)) {
+            const src = nameFor(id);
+            info.objects.push({
+                id: String(id),
+                name: src ? src.name : `Object_${id}`,
+                boundingBox: null,
+                area: null,
+                layer_height: null,
+            });
+        }
+        info.totalObjects = info.objects.length;
     }
 
     /**

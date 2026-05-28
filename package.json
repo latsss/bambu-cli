@@ -1,6 +1,6 @@
 {
   "name": "bambu-cli",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "CLI tool to interact with Bambu Lab printers in LAN/LAN+dev mode",
   "main": "index.js",
   "bin": {

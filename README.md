@@ -60,8 +60,9 @@ bambu-cli start my-printer /file.3mf
 bambu-cli skip my-printer 1993 1994
 
 # Objects
-bambu-cli get-objects my-printer --colored
-bambu-cli get-objects my-printer --shape    # silhouettes from the 3MF's top-down PNG
+bambu-cli get-objects my-printer              # silhouettes from the 3MF's top-down PNG
+bambu-cli get-objects my-printer --borders    # bounding-box rectangles instead of silhouettes
+bambu-cli get-objects --file ./plate.3mf      # read a local file instead of fetching from the printer
 
 # LED
 bambu-cli light my-printer on

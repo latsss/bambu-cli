@@ -190,9 +190,9 @@ program.command("light")
 
 program.command("get-objects")
     .description("Get object information from current print")
-    .argument("<printer>")
-    .option("--colored", "use colored output for visual representation")
-    .option("--shape", "render actual object silhouettes from the 3MF's top-down PNG (falls back to bounding boxes if absent)")
+    .argument("[printer]", "printer name (omit when using --file)")
+    .option("--file <path>", "read objects from a local .3mf/.gcode.3mf file instead of fetching from the printer")
+    .option("--borders", "render objects as bounding-box rectangles instead of the 3MF's top-down silhouettes (the default)")
     .action(runCommand(GetObjectsCommand, (printer) => ({ printerName: printer })));
 
 program.command("skip")

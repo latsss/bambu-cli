@@ -128,10 +128,25 @@ class ThreeMFParser {
                 ? this.sliceInfo.config.plate.object 
                 : [this.sliceInfo.config.plate.object];
             
+            // When the slicer's "instances" feature is used, the plate JSON has a SINGLE
+            // bbox_objects entry (the merged area of all instances) while slice_info lists
+            // every instance. Detect that case so we don't misattribute the combined bbox
+            // to whichever instance happens to be first in the list.
+            const bboxIds = Object.keys(bboxMap);
+            const looksLikeInstanceMerge =
+                bboxIds.length > 0 &&
+                bboxIds.length < plateObjects.length &&
+                !plateObjects.some((o) => bboxMap[o['@identify_id']]);
+
             plateObjects.forEach((obj, index) => {
                 const sliceId = obj['@identify_id'];
-                const bboxData = bboxMap[sliceId] || bboxMap[Object.keys(bboxMap)[index]] || null;
-                
+                let bboxData = bboxMap[sliceId];
+                // Only use the index fallback when bbox count matches instance count — i.e.
+                // the slicer wasn't using the instances copy feature.
+                if (!bboxData && !looksLikeInstanceMerge) {
+                    bboxData = bboxMap[bboxIds[index]] || null;
+                }
+
                 objects.push({
                     id: sliceId,
                     name: obj['@name'] || `Object_${index}`,
@@ -215,14 +230,15 @@ class ThreeMFParser {
     }
 
     /**
-     * Generate visual ASCII representation of objects
+     * Generate visual ASCII representation of objects.
+     * Colors are always applied via chalk, which auto-disables when NO_COLOR is set
+     * (the CLI's global --no-color flag wires that up).
      * @param {Array} objects - Array of objects with bounding boxes
      * @param {number} width - Terminal width (default 80)
      * @param {number} height - Terminal height (default 20)
-     * @param {boolean} colored - Whether to use colored output (default false)
      * @returns {string} ASCII representation
      */
-    generateVisualRepresentation(objects, width = 80, height = 20, colored = false) {
+    generateVisualRepresentation(objects, width = 80, height = 20) {
         if (!objects || objects.length === 0) {
             return "No objects to display";
         }
@@ -237,6 +253,19 @@ class ThreeMFParser {
                 maxY = Math.max(maxY, obj.boundingBox.max[1]);
             }
         });
+
+        // Files using the slicer's "instances" copy feature have no per-instance bboxes —
+        // skip the empty rectangle view and just list the objects.
+        if (!isFinite(minX)) {
+            let out = `Plate Layout (${objects.length} objects):\n`;
+            out += `(no per-object bounding boxes available — drop --borders for the shape view)\n\n`;
+            out += '📋 Object List:\n';
+            objects.forEach((obj, index) => {
+                const colorFn = this.colors[index % this.colors.length];
+                out += colorFn(`   ${obj.id}: ${obj.name}`) + '\n';
+            });
+            return out;
+        }
 
         // Add some padding
         const padding = 5;
@@ -266,8 +295,8 @@ class ThreeMFParser {
             const startY = Math.max(0, Math.min(y1, y2));
             const endY = Math.min(height - 1, Math.max(y1, y2));
 
-            // Get color for this object
-            const colorFn = colored ? this.colors[objIndex % this.colors.length] : null;
+            // Get color for this object (chalk auto-disables when NO_COLOR is set).
+            const colorFn = this.colors[objIndex % this.colors.length];
 
             // Draw rectangle
             for (let y = startY; y <= endY; y++) {
@@ -320,35 +349,21 @@ class ThreeMFParser {
         canvas.forEach(row => {
             let line = '│';
             row.forEach(cell => {
-                if (colored && cell.color) {
-                    line += cell.color(cell.char);
-                } else {
-                    line += cell.char;
-                }
+                line += cell.color ? cell.color(cell.char) : cell.char;
             });
             line += '│';
             result += line + '\n';
         });
-        
+
         result += '═'.repeat(width) + '\n';
         result += `Legend: # = Object, Numbers = Object IDs, Text = STL Names\n`;
-        if (colored) {
-            result += `Colors: Each object has a unique color for better identification\n`;
-        }
         result += `Scale: X: ${minX.toFixed(1)} to ${maxX.toFixed(1)} mm, Y: ${minY.toFixed(1)} to ${maxY.toFixed(1)} mm\n`;
-        
-        // Add object list with colors
+
         if (objects.length > 0) {
             result += '\n📋 Object List:\n';
             objects.forEach((obj, index) => {
-                const colorFn = colored ? this.colors[index % this.colors.length] : null;
-                const objectText = `   ${obj.id}: ${obj.name}`;
-                
-                if (colored && colorFn) {
-                    result += colorFn(objectText) + '\n';
-                } else {
-                    result += objectText + '\n';
-                }
+                const colorFn = this.colors[index % this.colors.length];
+                result += colorFn(`   ${obj.id}: ${obj.name}`) + '\n';
             });
         }
 
@@ -390,7 +405,7 @@ class ThreeMFParser {
      * For `pick` PNGs each distinct color is its own object — we colorize and try to label.
      * For `top` PNGs we just threshold luminance and render silhouettes (no per-object colors).
      */
-    renderShapeAscii(objects, plateImage, { width = 60, colored = true, label = true } = {}) {
+    renderShapeAscii(objects, plateImage, { width = 60, label = true } = {}) {
         if (!plateImage || !plateImage.png) return null;
         const { png, kind } = plateImage;
         const { width: pw, height: ph, data } = png;
@@ -402,123 +417,119 @@ class ThreeMFParser {
 
         const isBackground = (r, g, b, a) => a < 16 || (r < 16 && g < 16 && b < 16);
 
-        // --- step 1: downsample to a grid of RGBA cells via center-pixel sampling
-        const grid = new Array(height);
-        for (let cy = 0; cy < height; cy++) {
-            grid[cy] = new Array(width);
-            for (let cx = 0; cx < width; cx++) {
-                const px = Math.min(pw - 1, Math.floor((cx + 0.5) * cellW));
-                const py = Math.min(ph - 1, Math.floor((cy + 0.5) * cellH));
-                const idx = (py * pw + px) * 4;
-                grid[cy][cx] = [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
-            }
+        // Bambu/Orca encodes each printed instance's identify_id directly in the pick PNG's RGB:
+        //   id = r | (g << 8) | (b << 16).
+        // We use that to map regions → objects exactly, instead of color-quantizing (the old approach
+        // collapsed adjacent ids into one region — e.g. ids 83 & 98 both quantized to 0x50/0x60).
+        const idFromPixel = (r, g, b) => r | (g << 8) | (b << 16);
+
+        const knownIds = new Set();
+        for (const o of objects) {
+            const n = typeof o.id === "string" ? parseInt(o.id, 10) : o.id;
+            if (Number.isFinite(n)) knownIds.add(n);
         }
 
-        // --- step 2: collect distinct non-background colors with centroids
-        const regions = new Map(); // colorKey -> {r,g,b,sumX,sumY,count}
+        // --- step 1: per-pixel region stats keyed by decoded id (full image, no quantization).
+        // Tracks both pixel bbox and centroid so we can place labels and (optionally) derive mm bboxes.
+        const idStats = new Map(); // id -> {sumX, sumY, count, minX, minY, maxX, maxY}
+        let anyKnownIdsInPng = false;
         for (let y = 0; y < ph; y++) {
             for (let x = 0; x < pw; x++) {
                 const i = (y * pw + x) * 4;
                 const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
                 if (isBackground(r, g, b, a)) continue;
-                // pick PNGs use a small number of solid colors; quantize to be tolerant of AA.
-                const qr = r & 0xF0, qg = g & 0xF0, qb = b & 0xF0;
-                const key = (qr << 16) | (qg << 8) | qb;
-                let region = regions.get(key);
-                if (!region) {
-                    region = { r: qr, g: qg, b: qb, sumX: 0, sumY: 0, count: 0 };
-                    regions.set(key, region);
+                if (kind !== "pick") continue;
+                const id = idFromPixel(r, g, b);
+                // Ignore AA fringe pixels — only count exact matches against known instance ids.
+                if (!knownIds.has(id)) continue;
+                anyKnownIdsInPng = true;
+                let st = idStats.get(id);
+                if (!st) {
+                    st = { sumX: 0, sumY: 0, count: 0, minX: x, minY: y, maxX: x, maxY: y };
+                    idStats.set(id, st);
                 }
-                region.sumX += x; region.sumY += y; region.count++;
+                st.sumX += x; st.sumY += y; st.count++;
+                if (x < st.minX) st.minX = x;
+                if (y < st.minY) st.minY = y;
+                if (x > st.maxX) st.maxX = x;
+                if (y > st.maxY) st.maxY = y;
             }
         }
-        // drop tiny noise regions (< 0.05% of image)
         const minCount = Math.max(4, Math.floor(pw * ph * 0.0005));
-        const significant = [...regions.entries()].filter(([, r]) => r.count >= minCount);
+        const significantIds = [...idStats.entries()].filter(([, s]) => s.count >= minCount);
 
-        // --- step 3: match colors to object IDs (only useful for pick PNGs)
-        const colorKeyToObject = new Map();
-        if (kind === "pick" && objects.length > 0 && significant.length > 0) {
-            const objWithBBox = objects.filter((o) => o.boundingBox);
-            if (objWithBBox.length > 0) {
-                // Compute occupied pixel bounding box across detected regions.
-                let pminX = Infinity, pminY = Infinity, pmaxX = -Infinity, pmaxY = -Infinity;
-                for (const [, r] of significant) {
-                    const cx = r.sumX / r.count, cy = r.sumY / r.count;
-                    pminX = Math.min(pminX, cx); pminY = Math.min(pminY, cy);
-                    pmaxX = Math.max(pmaxX, cx); pmaxY = Math.max(pmaxY, cy);
-                }
-                // mm-space bbox across known objects
-                let mminX = Infinity, mminY = Infinity, mmaxX = -Infinity, mmaxY = -Infinity;
-                for (const o of objWithBBox) {
-                    const [x1, y1] = o.boundingBox.min;
-                    const [x2, y2] = o.boundingBox.max;
-                    mminX = Math.min(mminX, x1); mminY = Math.min(mminY, y1);
-                    mmaxX = Math.max(mmaxX, x2); mmaxY = Math.max(mmaxY, y2);
-                }
-                // Object centroids normalized to [0,1] in mm-space.
-                const objCentroids = objWithBBox.map((o) => {
-                    const cx = (o.boundingBox.min[0] + o.boundingBox.max[0]) / 2;
-                    const cy = (o.boundingBox.min[1] + o.boundingBox.max[1]) / 2;
-                    return {
-                        obj: o,
-                        nx: (cx - mminX) / Math.max(1e-6, mmaxX - mminX),
-                        ny: (cy - mminY) / Math.max(1e-6, mmaxY - mminY),
-                    };
-                });
-                // Region centroids normalized to [0,1] in pixel-space.
-                const regionCentroids = significant.map(([key, r]) => ({
-                    key, r: r.r, g: r.g, b: r.b,
-                    nx: (r.sumX / r.count - pminX) / Math.max(1e-6, pmaxX - pminX),
-                    ny: (r.sumY / r.count - pminY) / Math.max(1e-6, pmaxY - pminY),
-                }));
+        // Map id → object for quick lookup during render.
+        const idToObject = new Map();
+        const objectIndex = new Map(); // object.id (original) → 1-based index for labelling
+        objects.forEach((o, i) => {
+            objectIndex.set(o.id, i + 1);
+            const n = typeof o.id === "string" ? parseInt(o.id, 10) : o.id;
+            if (Number.isFinite(n)) idToObject.set(n, o);
+        });
 
-                // Try identity and Y-flip; pick assignment with smaller total distance.
-                const assign = (flipY) => {
-                    const taken = new Set();
-                    const out = new Map();
-                    let total = 0;
-                    for (const oc of objCentroids) {
-                        let best = null, bestD = Infinity;
-                        for (const rc of regionCentroids) {
-                            if (taken.has(rc.key)) continue;
-                            const ry = flipY ? 1 - rc.ny : rc.ny;
-                            const dx = oc.nx - rc.nx, dy = oc.ny - ry;
-                            const d = dx * dx + dy * dy;
-                            if (d < bestD) { bestD = d; best = rc; }
-                        }
-                        if (best) { taken.add(best.key); out.set(best.key, oc.obj); total += bestD; }
-                    }
-                    return { out, total };
-                };
-                const a = assign(false);
-                const b = assign(true);
-                const winner = b.total < a.total ? b : a;
-                for (const [k, v] of winner.out) colorKeyToObject.set(k, v);
-            }
-        }
-
-        // --- step 4: pick a chalk color per object/region
+        // --- step 2: pick a chalk color per object. Index-based so colors are stable across runs.
         const palette = [
             chalk.red, chalk.green, chalk.blue, chalk.yellow,
             chalk.magenta, chalk.cyan, chalk.redBright, chalk.greenBright,
             chalk.blueBright, chalk.yellowBright, chalk.magentaBright, chalk.cyanBright,
         ];
-        const objectIdToColorFn = new Map();
-        let paletteIdx = 0;
         const colorForObject = (obj) => {
-            if (!objectIdToColorFn.has(obj.id)) {
-                objectIdToColorFn.set(obj.id, palette[paletteIdx++ % palette.length]);
-            }
-            return objectIdToColorFn.get(obj.id);
+            const idx = (objectIndex.get(obj.id) || 1) - 1;
+            return palette[idx % palette.length];
         };
-        const colorKeyToFn = new Map();
-        for (const [key] of significant) {
-            const obj = colorKeyToObject.get(key);
-            colorKeyToFn.set(key, obj ? colorForObject(obj) : palette[paletteIdx++ % palette.length]);
+
+        // --- step 3: render into a 2D cell buffer so we can overlay labels.
+        const cells = new Array(height);
+        for (let cy = 0; cy < height; cy++) {
+            cells[cy] = new Array(width);
+            for (let cx = 0; cx < width; cx++) {
+                const px = Math.min(pw - 1, Math.floor((cx + 0.5) * cellW));
+                const py = Math.min(ph - 1, Math.floor((cy + 0.5) * cellH));
+                const idx = (py * pw + px) * 4;
+                const r = data[idx], g = data[idx + 1], b = data[idx + 2], a = data[idx + 3];
+                if (isBackground(r, g, b, a)) {
+                    cells[cy][cx] = { ch: " ", fn: null };
+                    continue;
+                }
+                if (kind === "pick") {
+                    const id = idFromPixel(r, g, b);
+                    const obj = idToObject.get(id);
+                    // If the PNG's RGB doesn't decode to any known instance id (non-Bambu
+                    // encoding, AA fringe, etc.), still render the silhouette uncolored
+                    // rather than dropping the pixel — better degraded view than blank.
+                    const fn = obj ? colorForObject(obj) : null;
+                    cells[cy][cx] = { ch: "█", fn };
+                } else {
+                    // top.png: pick a shading char from luminance.
+                    const lum = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
+                    const ch = lum > 0.66 ? "█" : lum > 0.33 ? "▓" : "░";
+                    cells[cy][cx] = { ch, fn: null };
+                }
+            }
         }
 
-        // --- step 5: render
+        // --- step 4: overlay 1-based index labels at each region's centroid (pick mode only).
+        // We use the 1-based index instead of the raw identify_id because identify_ids can be 2–3
+        // digits and crowd small regions; the legend below maps index → id → name.
+        if (kind === "pick") {
+            for (const [id, st] of significantIds) {
+                const obj = idToObject.get(id);
+                if (!obj) continue;
+                const px = st.sumX / st.count;
+                const py = st.sumY / st.count;
+                const gx = Math.min(width - 1, Math.max(0, Math.floor(px / cellW)));
+                const gy = Math.min(height - 1, Math.max(0, Math.floor(py / cellH)));
+                const label = String(objectIndex.get(obj.id));
+                const startX = Math.max(0, Math.min(width - label.length, gx - Math.floor(label.length / 2)));
+                // chalk.inverse swaps fg/bg so digits stand out against the colored block.
+                const baseFn = colorForObject(obj);
+                const labelFn = (s) => baseFn(chalk.inverse(s));
+                for (let i = 0; i < label.length; i++) {
+                    cells[gy][startX + i] = { ch: label[i], fn: labelFn };
+                }
+            }
+        }
+
         const lines = [];
         const top = "┌" + "─".repeat(width) + "┐";
         const bot = "└" + "─".repeat(width) + "┘";
@@ -526,19 +537,8 @@ class ThreeMFParser {
         for (let cy = 0; cy < height; cy++) {
             let row = "│";
             for (let cx = 0; cx < width; cx++) {
-                const [r, g, b, a] = grid[cy][cx];
-                if (isBackground(r, g, b, a)) { row += " "; continue; }
-                if (kind === "pick") {
-                    const key = ((r & 0xF0) << 16) | ((g & 0xF0) << 8) | (b & 0xF0);
-                    const fn = colorKeyToFn.get(key);
-                    const ch = "█";
-                    row += colored && fn ? fn(ch) : ch;
-                } else {
-                    // top.png: pick a shading char from luminance
-                    const lum = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
-                    const ch = lum > 0.66 ? "█" : lum > 0.33 ? "▓" : "░";
-                    row += ch;
-                }
+                const { ch, fn } = cells[cy][cx];
+                row += fn ? fn(ch) : ch;
             }
             row += "│";
             lines.push(row);
@@ -549,13 +549,12 @@ class ThreeMFParser {
             lines.push("");
             lines.push(`📋 Object List (${kind} mask${kind === "top" ? ", silhouettes only" : ""}):`);
             for (const obj of objects) {
-                const fn = colored ? objectIdToColorFn.get(obj.id) : null;
-                const txt = `   ${obj.id}: ${obj.name}`;
-                lines.push(fn ? fn(txt) : txt);
+                const idx = objectIndex.get(obj.id);
+                const fn = colorForObject(obj);
+                lines.push(fn(`   [${idx}] ${obj.id}: ${obj.name}`));
             }
-            const unmatched = significant.length - colorKeyToObject.size;
-            if (kind === "pick" && unmatched > 0) {
-                lines.push(chalk.gray(`   (${unmatched} detected region${unmatched === 1 ? "" : "s"} could not be matched to a known object)`));
+            if (kind === "pick" && objects.length > 0 && !anyKnownIdsInPng) {
+                lines.push(chalk.gray(`   (could not match any object id to pick PNG colors — diagram may be inaccurate)`));
             }
         }
 
